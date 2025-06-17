@@ -20,29 +20,23 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 
 warnings.filterwarnings("ignore")
 
-# Load data
-df = pd.read_csv("/Users/shanmukhimudundi/Desktop/MLOps/cleaned_for_modeling.csv")
+df = pd.read_csv("cleaned_modeling.csv")
 
-# Define columns
 text_column = 'Review Text'
 label_column = 'Reliability'
 
-# Label encoding
 label_mapping = {'UNRELIABLE': 0, 'RELIABLE': 1}
 df = df[df[label_column].isin(label_mapping)]
 y = df[label_column].map(label_mapping)
 X_text = df[text_column]
 
-# TF-IDF vectorization
 vectorizer = TfidfVectorizer(stop_words='english', max_features=5000)
 X = vectorizer.fit_transform(X_text)
 
-# Train-test split
 X_train, X_test, y_train, y_test = train_test_split(
     X, y, test_size=0.2, stratify=y, random_state=42
 )
 
-# Define models
 models = {
     "Logistic Regression": LogisticRegression(max_iter=1000),
     "Decision Tree": DecisionTreeClassifier(random_state=42),
@@ -53,15 +47,12 @@ models = {
     "KNN Classifier": KNeighborsClassifier()
 }
 
-# Evaluate models
 results = []
-
 for name, model in models.items():
     start = time.time()
     model.fit(X_train, y_train)
     y_pred = model.predict(X_test)
     end = time.time()
-
     results.append({
         "Model": name,
         "Accuracy": round(accuracy_score(y_test, y_pred), 4),
@@ -71,14 +62,9 @@ for name, model in models.items():
         "Train Time (s)": round(end - start, 3)
     })
 
-# Create DataFrame
 results_df = pd.DataFrame(results).sort_values(by="F1 Score", ascending=False)
-
-# Show table
 print("\n📊 Classification Model Evaluation Summary:")
 print(results_df.to_string(index=False))
-
-# Plot all metrics including Train Time
 metrics = ['Accuracy', 'Precision', 'Recall', 'F1 Score']
 models_list = results_df['Model'].tolist()
 
@@ -107,10 +93,10 @@ plt.grid(axis='y', linestyle='--', alpha=0.7)
 plt.tight_layout()
 plt.show()
 
-'''knn_model = KNeighborsClassifier()
-knn_model.fit(X_train, y_train)
 
-joblib.dump(knn_model, 'knn_model.pkl')
-print("KNN model saved successfully")
-joblib.dump(vectorizer, 'tfidf_vectorizer.pkl')
-print("TF-IDF saved successfully")'''
+'''joblib.dump(vectorizer, 'tfidf_vectorizer.pkl')
+print("TF-IDF saved successfully")
+random_model = RandomForestClassifier()
+random_model.fit(X_train,y_train)
+joblib.dump(random_model, 'random_model.pkl')
+print("Random Forest model saved successfully")'''
