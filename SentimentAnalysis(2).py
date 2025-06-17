@@ -2,6 +2,8 @@ import time
 import pandas as pd
 import spacy
 import requests
+import re
+import json
 
 TOGETHER_API_KEY = "0f204cdb020f5899698bbb8c8d1b12a74dc9ee54103d0272440e182e07037ea3"
 TOGETHER_MODEL = "mistralai/Mixtral-8x7B-Instruct-v0.1"
@@ -27,7 +29,7 @@ def clean_data(csv_file_path, na_values=None):
 
     print(f"\n📥 Reading file: {csv_file_path}")
     df = pd.read_csv(csv_file_path, na_values=na_values)
-
+    
     if "Verified Purchase" in df.columns:
         df["Verified Purchase"] = df["Verified Purchase"].apply(
             lambda x: "Yes" if str(x).strip().lower() == "yes" else "No"
@@ -48,7 +50,22 @@ def clean_data(csv_file_path, na_values=None):
 
     return df
 
-def query_together_api(prompt, max_tokens=10):
+def is_gibberish(text, min_meaningful_words=2, max_non_alpha_ratio=0.3):
+    if not text or not text.strip():
+        return True
+    doc = nlp(text)
+    meaningful_words = [token for token in doc if token.is_alpha and not token.is_stop]
+    if len(meaningful_words) < min_meaningful_words:
+        return True
+    non_alpha_chars = sum(1 for c in text if not c.isalpha() and not c.isspace())
+    total_chars = len(text)
+    if total_chars == 0:
+        return True
+    if (non_alpha_chars / total_chars) > max_non_alpha_ratio:
+        return True
+    return False
+
+def query_api(prompt, max_tokens=300):
     headers = {
         "Authorization": f"Bearer {TOGETHER_API_KEY}",
         "Content-Type": "application/json"
@@ -60,113 +77,176 @@ def query_together_api(prompt, max_tokens=10):
         "max_tokens": max_tokens,
         "top_p": 1.0
     }
-
     try:
         response = requests.post(TOGETHER_API_URL, headers=headers, json=body)
         response.raise_for_status()
-        return response.json()["choices"][0]["message"]["content"].strip().upper()
+        return response.json()["choices"][0]["message"]["content"].strip()
     except Exception as e:
         print(f"❌ API Error: {e}")
         return "ERROR"
 
-def analyze_review_sentiment(review_text, delay=1.2):
-    sentences = sentence_splitter(review_text)
-    pos_count = 0
-    neg_count = 0
-    neutral_count = 0
-    score_total = 0
-    scored_sentences = 0
+def build_batch_prompt(reviews):
+    prompt = (
+        "Classify the sentiment of the following reviews. "
+        "For each review, respond with a list of labels and scores for each sentence in this format: "
+        "[POSITIVE 0.8, NEGATIVE -0.6, NEUTRAL 0.0, ...] (in order).\n\n"
+    )
+    for i, review in enumerate(reviews, start=1):
+        prompt += f"Review {i}:\n"
+        sentences = sentence_splitter(review)
+        for idx, sent in enumerate(sentences, start=1):
+            prompt += f"{idx}. {sent}\n"
+        prompt += "\n"
 
-    for sent in sentences:
-        if not sent.strip():
-            continue
-        prompt = f"""Classify the sentiment of the following sentence. Respond with POSITIVE, NEGATIVE, or NEUTRAL, followed by a number between -1 and 1 as the sentiment score.
+    prompt += "Respond with the sentiment list per review, one line per review, starting with 'Review 1:', 'Review 2:', etc.\n"
+    return prompt
 
-Sentence: "{sent}"
-Response:"""
-        response = query_together_api(prompt, max_tokens=20)
-        label = "NEUTRAL"
-        score = 0.0
-        if "POSITIVE" in response:
-            label = "POSITIVE"
-            pos_count += 1
-        elif "NEGATIVE" in response:
-            label = "NEGATIVE"
-            neg_count += 1
-        elif "NEUTRAL" in response:
-            label = "NEUTRAL"
-            neutral_count += 1
+def parse_batch_response(response, batch_size):
+    results = []
+    split_reviews = re.split(r'Review\s+\d+:', response, flags=re.IGNORECASE)
+    split_reviews = [part.strip() for part in split_reviews if part.strip()]
+    
+    for part in split_reviews[:batch_size]:
+        items = re.findall(r'(POSITIVE|NEGATIVE|NEUTRAL)\s*(-?\d*\.?\d+)', part.upper())
+        pos_count = neg_count = neutral_count = 0
+        score_total = 0.0
+        scored_sentences = 0
+        for label, score_str in items:
+            score = float(score_str)
+            score_total += score
+            scored_sentences += 1
+            if label == "POSITIVE":
+                pos_count += 1
+            elif label == "NEGATIVE":
+                neg_count += 1
+            elif label == "NEUTRAL":
+                neutral_count += 1
 
-        try:
-            parts = response.replace(",", "").split()
-            score = float([s for s in parts if s.replace('.', '', 1).replace('-', '', 1).isdigit()][-1])
-        except Exception:
-            score = 0.0
+        avg_score = round(score_total / scored_sentences, 3) if scored_sentences > 0 else 0.0
+        if avg_score > 0.1:
+            sentiment = "POSITIVE"
+        elif avg_score < -0.1:
+            sentiment = "NEGATIVE"
+        else:
+            sentiment = "NEUTRAL"
 
-        score_total += score
-        scored_sentences += 1
+        results.append({
+            "Sentiment": sentiment,
+            "Sentiment Score": avg_score,
+            "Positive_Sentence_Count": pos_count,
+            "Negative_Sentence_Count": neg_count,
+            "Neutral_Sentence_Count": neutral_count,
+        })
+
+    while len(results) < batch_size:
+        results.append({
+            "Sentiment": "NEUTRAL",
+            "Sentiment Score": 0.0,
+            "Positive_Sentence_Count": 0,
+            "Negative_Sentence_Count": 0,
+            "Neutral_Sentence_Count": 0,
+        })
+    return results
+
+def determine_reliability(avg_score, review_text):
+    if is_gibberish(review_text):
+        return "UNRELIABLE"
+    if not review_text.strip() or len(review_text.split()) < 3:
+        return "UNRELIABLE"
+    if abs(avg_score) <= 0.2:
+        return "UNRELIABLE"
+    return "RELIABLE"
+
+def apply_batched_sentiment(df, review_column="Review Text", batch_size=20, delay=1.5):
+    print("\n🧠 Running Batched Sentiment Analysis...")
+    all_sentiments = []
+    all_scores = []
+    all_pos_counts = []
+    all_neg_counts = []
+    all_neutral_counts = []
+    all_reliability = []
+
+    num_reviews = len(df)
+    for start_idx in range(0, num_reviews, batch_size):
+        batch_reviews = df[review_column].iloc[start_idx:start_idx + batch_size].tolist()
+        print(f"🔍 Processing batch {start_idx // batch_size + 1} / {(num_reviews + batch_size -1)//batch_size} ({len(batch_reviews)} reviews)")
+
+        gibberish_flags = [is_gibberish(r) for r in batch_reviews]
+
+        if all(gibberish_flags):
+            batch_results = [{
+                "Sentiment": "NEUTRAL",
+                "Sentiment Score": 0.0,
+                "Positive_Sentence_Count": 0,
+                "Negative_Sentence_Count": 0,
+                "Neutral_Sentence_Count": 1,
+            }] * len(batch_reviews)
+        else:
+            reviews_to_api = [r for i,r in enumerate(batch_reviews) if not gibberish_flags[i]]
+            prompt = build_batch_prompt(reviews_to_api)
+            response = query_api(prompt, max_tokens=4000)
+            api_results = parse_batch_response(response, len(reviews_to_api))
+
+            batch_results = []
+            api_idx = 0
+            for is_gib in gibberish_flags:
+                if is_gib:
+                    batch_results.append({
+                        "Sentiment": "NEUTRAL",
+                        "Sentiment Score": 0.0,
+                        "Positive_Sentence_Count": 0,
+                        "Negative_Sentence_Count": 0,
+                        "Neutral_Sentence_Count": 1,
+                    })
+                else:
+                    batch_results.append(api_results[api_idx])
+                    api_idx += 1
+
+        for idx, res in enumerate(batch_results):
+            review_text = batch_reviews[idx]
+            reliability = determine_reliability(res["Sentiment Score"], review_text)
+            all_sentiments.append(res["Sentiment"])
+            all_scores.append(res["Sentiment Score"])
+            all_pos_counts.append(res["Positive_Sentence_Count"])
+            all_neg_counts.append(res["Negative_Sentence_Count"])
+            all_neutral_counts.append(res["Neutral_Sentence_Count"])
+            all_reliability.append(reliability)
+
         time.sleep(delay)
 
-    avg_score = round(score_total / scored_sentences, 3) if scored_sentences > 0 else 0.0
-
-    if avg_score > 0.1:
-        sentiment = "POSITIVE"
-    elif avg_score < -0.1:
-        sentiment = "NEGATIVE"
-    else:
-        sentiment = "NEUTRAL"
-
-    return sentiment, avg_score, pos_count, neg_count, neutral_count
-
-def determine_reliability_based_on_sentences(pos_count, neg_count, total_sentences, avg_score):
-    if abs(avg_score) <= 0.2:  # Neutral score condition
-        return "UNRELIABLE"
-    else:
-        return "RELIABLE"
-
-def apply_detailed_sentiment(df, review_column="Review Text"):
-    print("\n🧠 Running Sentiment Analysis...")
-    sentiments = []
-    scores = []
-    positive_counts = []
-    negative_counts = []
-    neutral_counts = []
-    reliability = []
-
-    for i, text in enumerate(df[review_column]):
-        print(f"🔍 Processing {i+1}/{len(df)}")
-        sentiment, avg_score, pos_count, neg_count, neutral_count = analyze_review_sentiment(text)
-        total_sentences = pos_count + neg_count + neutral_count
-        sentence_reliability = determine_reliability_based_on_sentences(
-            pos_count, neg_count, total_sentences, avg_score)
-        
-        sentiments.append(sentiment)
-        scores.append(avg_score)
-        positive_counts.append(pos_count)
-        negative_counts.append(neg_count)
-        neutral_counts.append(neutral_count)
-        reliability.append(sentence_reliability)
-
-    df["Sentiment"] = sentiments
-    df["Sentiment Score"] = scores
-    df["Positive_Sentence_Count"] = positive_counts
-    df["Negative_Sentence_Count"] = negative_counts
-    df["Neutral_Sentence_Count"] = neutral_counts
-    df["Reliability"] = reliability
+    df["Sentiment"] = all_sentiments
+    df["Sentiment Score"] = all_scores
+    df["Positive_Sentence_Count"] = all_pos_counts
+    df["Negative_Sentence_Count"] = all_neg_counts
+    df["Neutral_Sentence_Count"] = all_neutral_counts
+    df["Reliability"] = all_reliability
 
     print("\n📊 Sentiment Summary:")
     print(df["Sentiment"].value_counts())
+    print("\n📊 Reliability Summary:")
+    print(df["Reliability"].value_counts())
     return df
+
+def export_full_finetune_json(df, output_file="finetune_data.jsonl"):
+    with open(output_file, "w", encoding="utf-8") as f:
+        for _, row in df.iterrows():
+            record = row.dropna().to_dict()
+            f.write(json.dumps(record) + "\n")
+
+    print(f"✅ Full fine-tuning JSONL saved to {output_file}")
+
 
 if __name__ == "__main__":
     input_csv = "amazon_reviews.csv"
-    output_clean_csv = "amazon_reviews_cleaned.csv"
-    output_sentiment_csv = "amazon_reviews_sentiment.csv"
+    output_clean_csv = "cleaned.csv"
+    output_sentiment_csv = "sentiment_batched.csv"
 
     df_clean = clean_data(input_csv)
     df_clean.to_csv(output_clean_csv, index=False)
     print(f"\n✅ Cleaned data saved to {output_clean_csv}")
 
-    df_with_sentiment = apply_detailed_sentiment(df_clean)
+    df_with_sentiment = apply_batched_sentiment(df_clean, batch_size=20, delay=1.5)
     df_with_sentiment.to_csv(output_sentiment_csv, index=False)
     print(f"✅ Full sentiment results saved to {output_sentiment_csv}")
+
+export_full_finetune_json(df_with_sentiment)
